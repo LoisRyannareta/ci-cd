@@ -6,11 +6,12 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"      # 00/06/12/18 UTC
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  id-token: write
 
 concurrency:
   group: carpark-scraper-${{ github.ref }}
@@ -18,17 +19,16 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
+  AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+  AZURE_CONTAINER: "bronze"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -46,23 +46,47 @@ jobs:
           DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
         run: python scraper.py --out output
 
+      - name: Summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import pandas as pd
+          d = pd.read_csv("output/latest.csv")
+          total = len(d); matched = int(d["matched"].sum())
+          print("## Carpark snapshot")
+          print(f"- Total: {total}")
+          print(f"- Matched: {matched} ({matched/total*100:.1f}%)")
+          print(f"- Unmatched: {total - matched}")
+          print(f"- Avg occupancy: {d['occupancy_pct'].mean():.1f}%")
+          print(f"- Snapshot: {d['snapshot_timestamp'].iloc[0]}")
+          PY
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: carpark-snapshot-${{ github.run_number }}
           path: output/
           retention-days: 30
           if-no-files-found: error
 
-      - name: Commit latest snapshot
-        if: github.event_name != 'pull_request'
+      - name: Azure login (OIDC)
+        if: github.ref == 'refs/heads/main'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload bronze
+        if: github.ref == 'refs/heads/main'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/latest.csv
-          if git diff --staged --quiet; then
-            echo "Tidak ada perubahan"
-          else
-            git commit -m "chore: update carpark snapshot [skip ci]"
-            git push
-          fi
+          set -euo pipefail
+          SNAPSHOT=$(ls -t output/carpark_merged_*.csv | head -n1)
+          DATE=$(date -u +%Y-%m-%d); HOUR=$(date -u +%H)
+          az storage blob upload --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "hdb/carpark/ingest_date=$DATE/hour=$HOUR/$(basename "$SNAPSHOT")" \
+            --file "$SNAPSHOT" --auth-mode login --overwrite
+          az storage blob upload --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "hdb/carpark/latest/latest.csv" \
+            --file output/latest.csv --auth-mode login --overwrite
